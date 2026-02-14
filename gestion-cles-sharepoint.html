@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestion des Clés - Agence Immobilière</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Microsoft Authentication Library (MSAL) -->
+    <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        // Configuration MSAL
+        const msalConfig = {
+            auth: {
+                clientId: "7248ed4b-0b72-49f6-819d-87e4813fd80c", // À remplacer
+                authority: "https://login.microsoftonline.com/common",
+                redirectUri: window.location.origin
+            },
+            cache: {
+                cacheLocation: "localStorage",
+                storeAuthStateInCookie: false
+            }
+        };
+
+        // Scopes requis pour accéder à OneDrive/SharePoint
+        const loginRequest = {
+            scopes: [
+                "User.Read",
+                "Files.ReadWrite.All",
+                "Sites.ReadWrite.All"
+            ]
+        };
+
+        function App() {
+            const [msalInstance, setMsalInstance] = useState(null);
+            const [account, setAccount] = useState(null);
+            const [keys, setKeys] = useState([]);
+            const [showForm, setShowForm] = useState(false);
+            const [filter, setFilter] = useState('all');
+            const [searchQuery, setSearchQuery] = useState('');
+            const [loading, setLoading] = useState(false);
+            const [sharePointFileId, setSharePointFileId] = useState(null);
+            const [formData, setFormData] = useState({
+                keyNumber: '',
+                owner: '',
+                status: 'sortie',
+                personGiving: '',
+                personBorrowing: '',
+                reason: '',
+                dateOut: '',
+                timeOut: '',
+                dateIn: '',
+                timeIn: '',
+                personReturning: '',
+                photo: null,
+                photoPreview: null
+            });
+
+            useEffect(() => {
+                // Initialiser MSAL
+                const msal = new msal.PublicClientApplication(msalConfig);
+                setMsalInstance(msal);
+
+                // Vérifier si l'utilisateur est déjà connecté
+                msal.handleRedirectPromise().then((response) => {
+                    if (response) {
+                        setAccount(response.account);
+                    } else {
+                        const accounts = msal.getAllAccounts();
+                        if (accounts.length > 0) {
+                            setAccount(accounts[0]);
+                        }
+                    }
+                });
+            }, []);
+
+            useEffect(() => {
+                if (account) {
+                    loadKeysFromSharePoint();
+                }
+            }, [account]);
+
+            const handleLogin = async () => {
+                try {
+                    setLoading(true);
+                    const response = await msalInstance.loginPopup(loginRequest);
+                    setAccount(response.account);
+                } catch (error) {
+                    console.error('Erreur de connexion:', error);
+                    alert('Erreur lors de la connexion Microsoft');
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleLogout = () => {
+                msalInstance.logoutPopup();
+                setAccount(null);
+                setKeys([]);
+            };
+
+            const getAccessToken = async () => {
+                const request = {
+                    scopes: loginRequest.scopes,
+                    account: account
+                };
+
+                try {
+                    const response = await msalInstance.acquireTokenSilent(request);
+                    return response.accessToken;
+                } catch (error) {
+                    // Si le token silent échoue, demander interactivement
+                    const response = await msalInstance.acquireTokenPopup(request);
+                    return response.accessToken;
+                }
+            };
+
+            const loadKeysFromSharePoint = async () => {
+                try {
+                    setLoading(true);
+                    const token = await getAccessToken();
+
+                    // Rechercher le fichier dans OneDrive
+                    const searchResponse = await fetch(
+                        `https://graph.microsoft.com/v1.0/me/drive/root/search(q='Gestion_Cles_Agence.xlsx')`,
+                        {
+                            headers: {
+                                'Authorization': `Bearer ${token}`
+                            }
+                        }
+                    );
+
+                    const searchData = await searchResponse.json();
+                    
+                    if (searchData.value && searchData.value.length > 0) {
+                        const fileId = searchData.value[0].id;
+                        setSharePointFileId(fileId);
+
+                        // Télécharger le contenu du fichier
+                        const fileResponse = await fetch(
+                            `https://graph.microsoft.com/v1.0/me/drive/items/${fileId}/content`,
+                            {
+                                headers: {
+                                    'Authorization': `Bearer ${token}`
+                                }
+                            }
+                        );
+
+                        const blob = await fileResponse.blob();
+                        const arrayBuffer = await blob.arrayBuffer();
+                        
+                        // Parser le fichier Excel
+                        const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+                        const worksheet = workbook.Sheets['Registre des Clés'];
+                        const data = XLSX.utils.sheet_to_json(worksheet);
+
+                        // Convertir les données Excel en format application
+                        const loadedKeys = data.map((row, index) => ({
+                            id: (index + 1).toString(),
+                            keyNumber: row['N° Clé'] || '',
+                            owner: row['Propriétaire/Bailleur/Copropriété'] || '',
+                            reason: row['Motif'] || '',
+                            personGiving: row['Remise par'] || '',
+                            personBorrowing: row['Empruntée par'] || '',
+                            dateOut: row['Date sortie'] || '',
+                            timeOut: row['Heure sortie'] || '',
+                            dateIn: row['Date retour'] || null,
+                            timeIn: row['Heure retour'] || null,
+                            personReturning: row['Retournée par'] || null,
+                            status: row['Statut'] || 'En circulation'
+                        }));
+
+                        setKeys(loadedKeys);
+                    } else {
+                        alert('Fichier Excel non trouvé. Veuillez créer "Gestion_Cles_Agence.xlsx" dans votre OneDrive.');
+                    }
+                } catch (error) {
+                    console.error('Erreur de chargement:', error);
+                    alert('Erreur lors du chargement des données: ' + error.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const saveKeysToSharePoint = async (updatedKeys) => {
+                try {
+                    setLoading(true);
+                    const token = await getAccessToken();
+
+                    // Préparer les données pour Excel
+                    const excelData = updatedKeys.map(key => ({
+                        'N° Clé': key.keyNumber,
+                        'Propriétaire/Bailleur/Copropriété': key.owner,
+                        'Motif': key.reason,
+                        'Remise par': key.personGiving,
+                        'Empruntée par': key.personBorrowing,
+                        'Date sortie': key.dateOut,
+                        'Heure sortie': key.timeOut,
+                        'Date retour': key.dateIn || '',
+                        'Heure retour': key.timeIn || '',
+                        'Retournée par': key.personReturning || '',
+                        'Statut': key.dateIn ? 'Retournée' : 'En circulation'
+                    }));
+
+                    // Créer un nouveau workbook
+                    const wb = XLSX.utils.book_new();
+                    const ws = XLSX.utils.json_to_sheet(excelData);
+                    XLSX.utils.book_append_sheet(wb, ws, 'Registre des Clés');
+
+                    // Convertir en blob
+                    const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+                    const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+
+                    // Uploader vers SharePoint
+                    const uploadResponse = await fetch(
+                        `https://graph.microsoft.com/v1.0/me/drive/items/${sharePointFileId}/content`,
+                        {
+                            method: 'PUT',
+                            headers: {
+                                'Authorization': `Bearer ${token}`,
+                                'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                            },
+                            body: blob
+                        }
+                    );
+
+                    if (uploadResponse.ok) {
+                        alert('✅ Données synchronisées avec SharePoint !');
+                        await loadKeysFromSharePoint();
+                    } else {
+                        throw new Error('Erreur lors de la synchronisation');
+                    }
+                } catch (error) {
+                    console.error('Erreur de sauvegarde:', error);
+                    alert('❌ Erreur lors de la synchronisation: ' + error.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const handleInputChange = (e) => {
+                const { name, value } = e.target;
+                setFormData(prev => ({ ...prev, [name]: value }));
+            };
+
+            const handlePhotoChange = (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        setFormData(prev => ({
+                            ...prev,
+                            photo: reader.result,
+                            photoPreview: reader.result
+                        }));
+                    };
+                    reader.readAsDataURL(file);
+                }
+            };
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                
+                const newKey = {
+                    id: Date.now().toString(),
+                    keyNumber: formData.keyNumber,
+                    owner: formData.owner,
+                    status: formData.status,
+                    personGiving: formData.personGiving,
+                    personBorrowing: formData.personBorrowing,
+                    reason: formData.reason,
+                    dateOut: formData.dateOut,
+                    timeOut: formData.timeOut,
+                    dateIn: formData.dateIn || null,
+                    timeIn: formData.timeIn || null,
+                    personReturning: formData.personReturning || null,
+                    photo: formData.photo,
+                    createdAt: new Date().toISOString()
+                };
+
+                const updatedKeys = [...keys, newKey];
+                setKeys(updatedKeys);
+                
+                await saveKeysToSharePoint(updatedKeys);
+                
+                setShowForm(false);
+                resetForm();
+            };
+
+            const handleReturn = async (keyId) => {
+                const dateIn = prompt('Date de retour (AAAA-MM-JJ):');
+                if (!dateIn) return;
+                
+                const timeIn = prompt('Heure de retour (HH:MM):');
+                if (!timeIn) return;
+                
+                const personReturning = prompt('Personne qui retourne la clé:');
+                if (!personReturning) return;
+
+                const updatedKeys = keys.map(key => {
+                    if (key.id === keyId) {
+                        return {
+                            ...key,
+                            dateIn,
+                            timeIn,
+                            personReturning,
+                            status: 'retournee'
+                        };
+                    }
+                    return key;
+                });
+
+                setKeys(updatedKeys);
+                await saveKeysToSharePoint(updatedKeys);
+            };
+
+            const handleDelete = async (keyId) => {
+                if (window.confirm('Êtes-vous sûr de vouloir supprimer cet enregistrement ?')) {
+                    const updatedKeys = keys.filter(k => k.id !== keyId);
+                    setKeys(updatedKeys);
+                    await saveKeysToSharePoint(updatedKeys);
+                }
+            };
+
+            const resetForm = () => {
+                setFormData({
+                    keyNumber: '',
+                    owner: '',
+                    status: 'sortie',
+                    personGiving: '',
+                    personBorrowing: '',
+                    reason: '',
+                    dateOut: '',
+                    timeOut: '',
+                    dateIn: '',
+                    timeIn: '',
+                    personReturning: '',
+                    photo: null,
+                    photoPreview: null
+                });
+            };
+
+            const filteredKeys = keys.filter(key => {
+                if (filter === 'out' && key.dateIn) return false;
+                if (filter === 'in' && !key.dateIn) return false;
+                
+                if (searchQuery) {
+                    const query = searchQuery.toLowerCase();
+                    return (
+                        key.keyNumber.toLowerCase().includes(query) ||
+                        key.owner.toLowerCase().includes(query) ||
+                        key.personBorrowing.toLowerCase().includes(query) ||
+                        key.personGiving.toLowerCase().includes(query) ||
+                        (key.reason && key.reason.toLowerCase().includes(query))
+                    );
+                }
+                
+                return true;
+            });
+
+            // Écran de connexion
+            if (!account) {
+                return (
+                    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
+                        <div className="bg-white rounded-xl shadow-2xl p-12 max-w-md w-full text-center">
+                            <div className="mb-8">
+                                <div className="text-6xl mb-4">🔑</div>
+                                <h1 className="text-3xl font-bold text-gray-800 mb-2">
+                                    Gestion des Clés
+                                </h1>
+                                <p className="text-gray-600">Agence Immobilière</p>
+                            </div>
+                            
+                            <div className="mb-8">
+                                <p className="text-gray-700 mb-4">
+                                    Connectez-vous avec votre compte Microsoft 365 pour accéder à l'application
+                                </p>
+                            </div>
+
+                            <button
+                                onClick={handleLogin}
+                                disabled={loading}
+                                className="w-full bg-blue-600 hover:bg-blue-700 text-white px-8 py-4 rounded-lg font-semibold transition-colors shadow-lg disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3"
+                            >
+                                {loading ? (
+                                    <>⏳ Connexion en cours...</>
+                                ) : (
+                                    <>
+                                        <svg className="w-6 h-6" viewBox="0 0 23 23" fill="none">
+                                            <path d="M11 0H0v11h11V0z" fill="#f25022"/>
+                                            <path d="M23 0H12v11h11V0z" fill="#00a4ef"/>
+                                            <path d="M11 12H0v11h11V12z" fill="#7fba00"/>
+                                            <path d="M23 12H12v11h11V12z" fill="#ffb900"/>
+                                        </svg>
+                                        Se connecter avec Microsoft
+                                    </>
+                                )}
+                            </button>
+
+                            <div className="mt-8 text-sm text-gray-500">
+                                <p>🔒 Connexion sécurisée via Microsoft</p>
+                                <p>📊 Synchronisation automatique avec SharePoint</p>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            // Application principale (identique à avant, mais avec les données de SharePoint)
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+                    <div className="container mx-auto px-4 py-8 max-w-6xl">
+                        {/* Header */}
+                        <div className="bg-white rounded-xl shadow-lg p-6 mb-8">
+                            <div className="flex justify-between items-start">
+                                <div>
+                                    <h1 className="text-4xl font-bold text-gray-800 mb-2">
+                                        🔑 Gestion des Clés
+                                    </h1>
+                                    <p className="text-gray-600">Suivi des mouvements de clés de l'agence</p>
+                                </div>
+                                <div className="text-right">
+                                    <div className="mb-2">
+                                        <span className="bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm">
+                                            ✓ Connecté: {account.username}
+                                        </span>
+                                    </div>
+                                    <button
+                                        onClick={handleLogout}
+                                        className="text-sm text-red-600 hover:text-red-800"
+                                    >
+                                        Se déconnecter
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        {loading && (
+                            <div className="bg-blue-100 border border-blue-400 text-blue-800 px-4 py-3 rounded-lg mb-6">
+                                ⏳ Synchronisation avec SharePoint en cours...
+                            </div>
+                        )}
+
+                        {/* Actions */}
+                        <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
+                            <div className="flex flex-wrap gap-4 items-center justify-between mb-4">
+                                <div className="flex gap-3">
+                                    <button
+                                        onClick={() => setShowForm(!showForm)}
+                                        className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors shadow-md"
+                                    >
+                                        {showForm ? '✕ Annuler' : '+ Nouvelle sortie de clé'}
+                                    </button>
+                                    
+                                    <button
+                                        onClick={loadKeysFromSharePoint}
+                                        disabled={loading}
+                                        className="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors shadow-md disabled:opacity-50"
+                                    >
+                                        🔄 Actualiser
+                                    </button>
+                                </div>
+                                
+                                <div className="flex gap-2">
+                                    <button
+                                        onClick={() => setFilter('all')}
+                                        className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                                            filter === 'all' 
+                                                ? 'bg-indigo-600 text-white' 
+                                                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                                        }`}
+                                    >
+                                        Tout ({keys.length})
+                                    </button>
+                                    <button
+                                        onClick={() => setFilter('out')}
+                                        className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                                            filter === 'out' 
+                                                ? 'bg-orange-600 text-white' 
+                                                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                                        }`}
+                                    >
+                                        En circulation ({keys.filter(k => !k.dateIn).length})
+                                    </button>
+                                    <button
+                                        onClick={() => setFilter('in')}
+                                        className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                                            filter === 'in' 
+                                                ? 'bg-green-600 text-white' 
+                                                : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                                        }`}
+                                    >
+                                        Retournées ({keys.filter(k => k.dateIn).length})
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            {/* Search Bar */}
+                            <div className="mt-4">
+                                <input
+                                    type="text"
+                                    placeholder="🔍 Rechercher une clé (numéro, propriétaire, emprunteur, motif...)"
+                                    value={searchQuery}
+                                    onChange={(e) => setSearchQuery(e.target.value)}
+                                    className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-lg"
+                                />
+                            </div>
+                        </div>
+
+                        {/* Form - identique à l'original */}
+                        {showForm && (
+                            <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
+                                <h2 className="text-2xl font-bold text-gray-800 mb-6">Nouvelle sortie de clé</h2>
+                                <form onSubmit={handleSubmit} className="space-y-4">
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Numéro de clé *
+                                            </label>
+                                            <input
+                                                type="text"
+                                                name="keyNumber"
+                                                value={formData.keyNumber}
+                                                onChange={handleInputChange}
+                                                required
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                placeholder="Ex: A-101"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Propriétaire / Bailleur / Copropriété *
+                                            </label>
+                                            <input
+                                                type="text"
+                                                name="owner"
+                                                value={formData.owner}
+                                                onChange={handleInputChange}
+                                                required
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                placeholder="Nom du propriétaire"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Personne qui remet la clé *
+                                            </label>
+                                            <input
+                                                type="text"
+                                                name="personGiving"
+                                                value={formData.personGiving}
+                                                onChange={handleInputChange}
+                                                required
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                placeholder="Nom de l'agent"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Personne qui emprunte *
+                                            </label>
+                                            <input
+                                                type="text"
+                                                name="personBorrowing"
+                                                value={formData.personBorrowing}
+                                                onChange={handleInputChange}
+                                                required
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                placeholder="Nom de l'emprunteur"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Motif de la sortie *
+                                            </label>
+                                            <select
+                                                name="reason"
+                                                value={formData.reason}
+                                                onChange={handleInputChange}
+                                                required
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                            >
+                                                <option value="">Sélectionner un motif</option>
+                                                <option value="visite">Visite</option>
+                                                <option value="travaux">Travaux</option>
+                                                <option value="sortie-definitive">Sortie définitive</option>
+                                                <option value="etat-des-lieux">État des lieux</option>
+                                                <option value="diagnostic">Diagnostic</option>
+                                                <option value="expertise">Expertise</option>
+                                                <option value="autre">Autre</option>
+                                            </select>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Date de sortie *
+                                            </label>
+                                            <input
+                                                type="date"
+                                                name="dateOut"
+                                                value={formData.dateOut}
+                                                onChange={handleInputChange}
+                                                required
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Heure de sortie *
+                                            </label>
+                                            <input
+                                                type="time"
+                                                name="timeOut"
+                                                value={formData.timeOut}
+                                                onChange={handleInputChange}
+                                                required
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                            />
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                                Photo de la clé
+                                            </label>
+                                            <input
+                                                type="file"
+                                                accept="image/*"
+                                                onChange={handlePhotoChange}
+                                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    {formData.photoPreview && (
+                                        <div className="mt-4">
+                                            <p className="text-sm font-semibold text-gray-700 mb-2">Aperçu de la photo:</p>
+                                            <img 
+                                                src={formData.photoPreview} 
+                                                alt="Aperçu" 
+                                                className="max-w-xs h-48 object-cover rounded-lg shadow-md"
+                                            />
+                                        </div>
+                                    )}
+
+                                    <div className="flex gap-3 pt-4">
+                                        <button
+                                            type="submit"
+                                            disabled={loading}
+                                            className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors disabled:opacity-50"
+                                        >
+                                            {loading ? 'Enregistrement...' : 'Enregistrer'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setShowForm(false);
+                                                resetForm();
+                                            }}
+                                            className="bg-gray-300 hover:bg-gray-400 text-gray-800 px-6 py-3 rounded-lg font-semibold transition-colors"
+                                        >
+                                            Annuler
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        )}
+
+                        {/* Keys List - identique à l'original */}
+                        <div className="space-y-4">
+                            {filteredKeys.length === 0 ? (
+                                <div className="bg-white rounded-xl shadow-lg p-12 text-center">
+                                    <p className="text-gray-500 text-lg">Aucune clé enregistrée</p>
+                                </div>
+                            ) : (
+                                filteredKeys.map(key => (
+                                    <div key={key.id} className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transition-shadow">
+                                        <div className="flex flex-col md:flex-row gap-6">
+                                            {key.photo && (
+                                                <div className="flex-shrink-0">
+                                                    <img 
+                                                        src={key.photo} 
+                                                        alt={`Clé ${key.keyNumber}`}
+                                                        className="w-32 h-32 object-cover rounded-lg shadow-md"
+                                                    />
+                                                </div>
+                                            )}
+
+                                            <div className="flex-grow">
+                                                <div className="flex items-start justify-between mb-4">
+                                                    <div>
+                                                        <h3 className="text-2xl font-bold text-gray-800">
+                                                            Clé #{key.keyNumber}
+                                                        </h3>
+                                                        <p className="text-lg text-indigo-600 font-semibold mt-1">
+                                                            {key.owner}
+                                                        </p>
+                                                        <div className="flex gap-2 mt-2">
+                                                            <span className={`inline-block px-3 py-1 rounded-full text-sm font-semibold ${
+                                                                key.dateIn 
+                                                                    ? 'bg-green-100 text-green-800' 
+                                                                    : 'bg-orange-100 text-orange-800'
+                                                            }`}>
+                                                                {key.dateIn ? '✓ Retournée' : '→ En circulation'}
+                                                            </span>
+                                                            <span className="inline-block px-3 py-1 rounded-full text-sm font-semibold bg-blue-100 text-blue-800">
+                                                                {key.reason === 'visite' && '👁️ Visite'}
+                                                                {key.reason === 'travaux' && '🔨 Travaux'}
+                                                                {key.reason === 'sortie-definitive' && '📦 Sortie définitive'}
+                                                                {key.reason === 'etat-des-lieux' && '📋 État des lieux'}
+                                                                {key.reason === 'diagnostic' && '🔍 Diagnostic'}
+                                                                {key.reason === 'expertise' && '⚖️ Expertise'}
+                                                                {key.reason === 'autre' && '📌 Autre'}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                    
+                                                    <div className="flex gap-2">
+                                                        {!key.dateIn && (
+                                                            <button
+                                                                onClick={() => handleReturn(key.id)}
+                                                                disabled={loading}
+                                                                className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-semibold transition-colors text-sm disabled:opacity-50"
+                                                            >
+                                                                Marquer comme retournée
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            onClick={() => handleDelete(key.id)}
+                                                            disabled={loading}
+                                                            className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-semibold transition-colors text-sm disabled:opacity-50"
+                                                        >
+                                                            Supprimer
+                                                        </button>
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                    <div>
+                                                        <p className="text-sm font-semibold text-gray-600">Remise par:</p>
+                                                        <p className="text-lg text-gray-800">{key.personGiving}</p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-sm font-semibold text-gray-600">Empruntée par:</p>
+                                                        <p className="text-lg text-gray-800">{key.personBorrowing}</p>
+                                                    </div>
+                                                    <div>
+                                                        <p className="text-sm font-semibold text-gray-600">Sortie:</p>
+                                                        <p className="text-lg text-gray-800">
+                                                            {key.dateOut} à {key.timeOut}
+                                                        </p>
+                                                    </div>
+                                                    {key.dateIn && (
+                                                        <>
+                                                            <div>
+                                                                <p className="text-sm font-semibold text-gray-600">Retour:</p>
+                                                                <p className="text-lg text-gray-800">
+                                                                    {key.dateIn} à {key.timeIn}
+                                                                </p>
+                                                            </div>
+                                                            {key.personReturning && (
+                                                                <div>
+                                                                    <p className="text-sm font-semibold text-gray-600">Retournée par:</p>
+                                                                    <p className="text-lg text-gray-800">{key.personReturning}</p>
+                                                                </div>
+                                                            )}
+                                                        </>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+    
+    <!-- Ajouter SheetJS pour parser Excel -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</body>
+</html>
