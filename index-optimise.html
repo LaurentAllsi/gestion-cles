@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gestion des Clés - Agence Immobilière</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Microsoft Authentication Library (MSAL) -->
+  <script src="https://alcdn.msauth.net/browser/2.38.1/js/msal-browser.min.js"></script>
+  <!-- SheetJS pour Excel -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      // --- États ---
+      const [msalInstance, setMsalInstance] = useState(null);
+      const [account, setAccount] = useState(null);
+      const [keys, setKeys] = useState([]);
+      const [showForm, setShowForm] = useState(false);
+      const [filter, setFilter] = useState('all');
+      const [searchQuery, setSearchQuery] = useState('');
+      const [loading, setLoading] = useState(false);
+      const [sharePointFileId, setSharePointFileId] = useState(null);
+      const [sharePointDriveId, setSharePointDriveId] = useState(null);
+
+      const [formData, setFormData] = useState({
+        keyNumber: '',
+        owner: '',
+        status: 'sortie',
+        personGiving: '',
+        personBorrowing: '',
+        reason: '',
+        dateOut: '',
+        timeOut: '',
+        dateIn: '',
+        timeIn: '',
+        personReturning: '',
+        photoFile: null,
+        photoPreview: null
+      });
+
+      // --- Initialisation MSAL ---
+      useEffect(() => {
+        initializeMsal();
+      }, []);
+
+      const initializeMsal = async () => {
+        const msalConfig = {
+          auth: {
+            clientId: "7248ed4b-0b72-49f6-819d-87e4813fd80c", // Client ID Azure AD
+            authority: "https://login.microsoftonline.com/9b6f0a5e-fd44-4a3f-a1de-430911fda398",
+            redirectUri: window.location.origin + window.location.pathname,
+          },
+          cache: {
+            cacheLocation: "localStorage",
+            storeAuthStateInCookie: false,
+          },
+        };
+
+        try {
+          const msal = new window.msal.PublicClientApplication(msalConfig);
+          await msal.initialize();
+          setMsalInstance(msal);
+
+          const response = await msal.handleRedirectPromise();
+          if (response) {
+            setAccount(response.account);
+          } else {
+            const accounts = msal.getAllAccounts();
+            if (accounts.length > 0) setAccount(accounts[0]);
+          }
+        } catch (error) {
+          console.error('Erreur initialisation MSAL:', error);
+          alert("Erreur d'initialisation de l'authentification: " + error.message);
+        }
+      };
+
+      // Charger si déjà connecté
+      useEffect(() => {
+        if (account) {
+          loadKeysFromSharePoint();
+        }
+      }, [account]);
+
+      // --- Auth ---
+      const handleLogin = async () => {
+        if (!msalInstance) {
+          alert('Authentification non initialisée. Veuillez rafraîchir la page.');
+          return;
+        }
+        const loginRequest = { scopes: ["User.Read", "Files.ReadWrite.All", "Sites.ReadWrite.All"] };
+        try {
+          setLoading(true);
+          const response = await msalInstance.loginPopup(loginRequest);
+          setAccount(response.account);
+        } catch (error) {
+          console.error('Erreur de connexion:', error);
+          alert('Erreur lors de la connexion Microsoft: ' + error.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const handleLogout = () => {
+        if (msalInstance) {
+          msalInstance.logoutPopup();
+          setAccount(null);
+          setKeys([]);
+        }
+      };
+
+      const getAccessToken = async () => {
+        const request = {
+          scopes: ["User.Read", "Files.ReadWrite.All", "Sites.ReadWrite.All"],
+          account: account,
+        };
+        try {
+          const response = await msalInstance.acquireTokenSilent(request);
+          return response.accessToken;
+        } catch (error) {
+          const response = await msalInstance.acquireTokenPopup(request);
+          return response.accessToken;
+        }
+      };
+
+      // -------------------------------------------------------
+      //  Lecture du fichier Excel sur SharePoint (optimisée)
+      // -------------------------------------------------------
+      const loadKeysFromSharePoint = async () => {
+        try {
+          setLoading(true);
+          const token = await getAccessToken();
+
+          // 1) Résoudre le site
+          const siteUrl = "allsimmo.sharepoint.com:/sites/ALLSIMMO-ClsLocationGestion";
+          const siteResponse = await fetch(
+            `https://graph.microsoft.com/v1.0/sites/${siteUrl}`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (!siteResponse.ok) throw new Error('Site SharePoint non trouvé.');
+          const siteData = await siteResponse.json();
+          const siteId = siteData.id;
+
+          // 2) Récupérer le drive Documents (racine = /Documents)
+          const driveResponse = await fetch(
+            `https://graph.microsoft.com/v1.0/sites/${siteId}/drive`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (!driveResponse.ok) throw new Error("Drive 'Documents' non trouvé.");
+          const driveData = await driveResponse.json();
+          const driveId = driveData.id;
+          setSharePointDriveId(driveId);
+
+          // 3) Essai 1 : chemin officiel exact (sans "Shared Documents")
+          let tried = [];
+          let fileResponse = null;
+
+          const tryPath = async (path) => {
+            tried.push(path);
+            const encoded = encodeURIComponent(path).replace(/%2F/g, '/');
+            const res = await fetch(
+              `https://graph.microsoft.com/v1.0/drives/${driveId}/root:${encoded}`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            return res;
+          };
+
+          const preferredPaths = [
+            "/Clés Location Gestion Vente/Gestion_Cles_Agence.xlsx",
+            "/Gestion_Cles_Agence.xlsx",
+          ];
+
+          for (const p of preferredPaths) {
+            const res = await tryPath(p);
+            if (res.ok) { fileResponse = res; break; }
+          }
+
+          // 4) Fallback : recherche globale par nom (insensible à la casse)
+          if (!fileResponse || !fileResponse.ok) {
+            console.warn('Recherche automatique du fichier dans tout le drive…');
+            const searchRes = await fetch(
+              `https://graph.microsoft.com/v1.0/drives/${driveId}/root/search(q='Gestion_Cles_Agence.xlsx')`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            if (searchRes.ok) {
+              const data = await searchRes.json();
+              const hit = (data.value || []).find(v => (v.name || '').toLowerCase() === 'gestion_cles_agence.xlsx');
+              if (hit) {
+                fileResponse = await fetch(
+                  `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${hit.id}`,
+                  { headers: { Authorization: `Bearer ${token}` } }
+                );
+              }
+            }
+          }
+
+          if (!fileResponse || !fileResponse.ok) {
+            const msg = `Fichier introuvable. Chemins testés :\n- ${tried.join('\n- ')}\nAstuce : vérifiez le nom exact et l'emplacement dans \'Clés Location Gestion Vente\'.`;
+            throw new Error(msg);
+          }
+
+          const fileData = await fileResponse.json();
+          const fileId = fileData.id;
+          setSharePointFileId(fileId);
+
+          // 5) Télécharger le contenu Excel
+          const contentRes = await fetch(
+            `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${fileId}/content`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (!contentRes.ok) throw new Error('Téléchargement du fichier Excel impossible.');
+          const blob = await contentRes.blob();
+          const arrayBuffer = await blob.arrayBuffer();
+
+          const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+          const sheet = workbook.Sheets['Registre des Clés'];
+          if (!sheet) {
+            alert("Feuille 'Registre des Clés' non trouvée dans l'Excel.");
+            setKeys([]);
+            return;
+          }
+
+          const rows = XLSX.utils.sheet_to_json(sheet);
+          const loadedKeys = rows.map((row, index) => ({
+            id: (Date.now() + index).toString(),
+            keyNumber: row['N° Clé'] || '',
+            owner: row['Propriétaire/Bailleur/Copropriété'] || '',
+            reason: row['Motif'] || '',
+            personGiving: row['Remise par'] || '',
+            personBorrowing: row['Empruntée par'] || '',
+            dateOut: row['Date sortie'] || '',
+            timeOut: row['Heure sortie'] || '',
+            dateIn: row['Date retour'] || null,
+            timeIn: row['Heure retour'] || null,
+            personReturning: row['Retournée par'] || null,
+            status: (row['Statut'] || '').toLowerCase() || (row['Date retour'] ? 'retournee' : 'sortie'),
+            photoUrl: row['Photo'] || null,
+          }));
+
+          setKeys(loadedKeys);
+          console.log('Clés chargées:', loadedKeys.length);
+        } catch (error) {
+          console.error('Erreur de chargement complète:', error);
+          alert('Erreur lors du chargement: ' + error.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      // -------------------------------------------------------
+      //  Sauvegarde des données dans l'Excel (écriture)
+      // -------------------------------------------------------
+      const saveKeysToSharePoint = async (updatedKeys) => {
+        try {
+          const token = await getAccessToken();
+          if (!sharePointFileId || !sharePointDriveId) throw new Error('Fichier SharePoint non initialisé.');
+
+          const excelData = updatedKeys.map(k => ({
+            'N° Clé': k.keyNumber,
+            'Propriétaire/Bailleur/Copropriété': k.owner,
+            'Motif': k.reason,
+            'Remise par': k.personGiving,
+            'Empruntée par': k.personBorrowing,
+            'Date sortie': k.dateOut,
+            'Heure sortie': k.timeOut,
+            'Date retour': k.dateIn || '',
+            'Heure retour': k.timeIn || '',
+            'Retournée par': k.personReturning || '',
+            'Statut': k.dateIn ? 'retournee' : 'sortie',
+            'Photo': k.photoUrl || '',
+          }));
+
+          const wb = XLSX.utils.book_new();
+          const ws = XLSX.utils.json_to_sheet(excelData);
+          ws['!cols'] = [
+            { wch: 12 }, { wch: 32 }, { wch: 20 }, { wch: 18 }, { wch: 20 },
+            { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 12 }, { wch: 18 },
+            { wch: 12 }, { wch: 60 }
+          ];
+          XLSX.utils.book_append_sheet(wb, ws, 'Registre des Clés');
+
+          const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+          const blob = new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+
+          const uploadResponse = await fetch(
+            `https://graph.microsoft.com/v1.0/drives/${sharePointDriveId}/items/${sharePointFileId}/content`,
+            {
+              method: 'PUT',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+              },
+              body: blob
+            }
+          );
+
+          if (!uploadResponse.ok) {
+            const errorText = await uploadResponse.text();
+            console.error('Erreur upload:', errorText);
+            throw new Error('Erreur lors de la synchronisation avec SharePoint');
+          }
+
+          console.log('✅ Synchronisé avec SharePoint');
+          await loadKeysFromSharePoint();
+        } catch (error) {
+          console.error('Erreur de sauvegarde:', error);
+          throw error;
+        }
+      };
+
+      // -------------------------------------------------------
+      //  Upload photo → dossier /Clés Location Gestion Vente/Photos_Cles
+      // -------------------------------------------------------
+      const uploadPhotoToOneDrive = async (file, keyNumber) => {
+        try {
+          const token = await getAccessToken();
+          if (!sharePointDriveId) throw new Error('Drive SharePoint non initialisé');
+
+          const folderPath = "/Clés Location Gestion Vente/Photos_Cles";
+          const encodedFolderPath = encodeURIComponent(folderPath).replace(/%2F/g, '/');
+
+          // Vérifier le dossier (GET) ou le créer
+          let folderOk = false;
+          const checkRes = await fetch(
+            `https://graph.microsoft.com/v1.0/drives/${sharePointDriveId}/root:${encodedFolderPath}`,
+            { headers: { 'Authorization': `Bearer ${token}` } }
+          );
+          folderOk = checkRes.ok;
+
+          if (!folderOk) {
+            const parentPath = "/Clés Location Gestion Vente";
+            const encodedParentPath = encodeURIComponent(parentPath).replace(/%2F/g, '/');
+            const createRes = await fetch(
+              `https://graph.microsoft.com/v1.0/drives/${sharePointDriveId}/root:${encodedParentPath}:/children`,
+              {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  name: 'Photos_Cles',
+                  folder: {},
+                  '@microsoft.graph.conflictBehavior': 'rename'
+                })
+              }
+            );
+            if (!createRes.ok) throw new Error("Impossible de créer le dossier 'Photos_Cles'.");
+          }
+
+          const timestamp = Date.now();
+          const extension = (file.name.split('.').pop() || 'jpg').toLowerCase();
+          const safeKey = (keyNumber || 'sans_numero').toString().replace(/[^a-zA-Z0-9]/g, '_');
+          const fileName = `cle_${safeKey}_${timestamp}.${extension}`;
+
+          const uploadPath = `${folderPath}/${fileName}`;
+          const encodedUploadPath = encodeURIComponent(uploadPath).replace(/%2F/g, '/');
+
+          const uploadResponse = await fetch(
+            `https://graph.microsoft.com/v1.0/drives/${sharePointDriveId}/root:${encodedUploadPath}:/content`,
+            {
+              method: 'PUT',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': file.type || 'image/jpeg'
+              },
+              body: file
+            }
+          );
+
+          if (!uploadResponse.ok) throw new Error("Erreur lors de l'upload de la photo");
+
+          const uploadData = await uploadResponse.json();
+          const shareResponse = await fetch(
+            `https://graph.microsoft.com/v1.0/drives/${sharePointDriveId}/items/${uploadData.id}/createLink`,
+            {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ type: 'view', scope: 'organization' })
+            }
+          );
+
+          if (!shareResponse.ok) return null;
+          const shareData = await shareResponse.json();
+          return shareData.link?.webUrl || null;
+        } catch (error) {
+          console.error('Erreur upload photo:', error);
+          throw error;
+        }
+      };
+
+      // --- Handlers formulaire ---
+      const handleInputChange = (e) => {
+        const { name, value } = e.target;
+        setFormData(prev => ({ ...prev, [name]: value }));
+      };
+
+      const handlePhotoChange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          if (file.size > 5 * 1024 * 1024) {
+            alert('La photo est trop volumineuse (max 5MB)');
+            return;
+          }
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            setFormData(prev => ({ ...prev, photoFile: file, photoPreview: reader.result }));
+          };
+          reader.readAsDataURL(file);
+        }
+      };
+
+      const resetForm = () => {
+        setFormData({
+          keyNumber: '', owner: '', status: 'sortie',
+          personGiving: '', personBorrowing: '', reason: '',
+          dateOut: '', timeOut: '', dateIn: '', timeIn: '',
+          personReturning: '', photoFile: null, photoPreview: null
+        });
+      };
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        setLoading(true);
+        try {
+          let photoUrl = null;
+          if (formData.photoFile) {
+            try {
+              photoUrl = await uploadPhotoToOneDrive(formData.photoFile, formData.keyNumber);
+            } catch (_) {
+              alert("⚠️ Erreur lors de l'upload de la photo. La clé sera enregistrée sans photo.");
+            }
+          }
+
+          const newKey = {
+            id: Date.now().toString(),
+            keyNumber: formData.keyNumber,
+            owner: formData.owner,
+            status: 'sortie',
+            personGiving: formData.personGiving,
+            personBorrowing: formData.personBorrowing,
+            reason: formData.reason,
+            dateOut: formData.dateOut,
+            timeOut: formData.timeOut,
+            dateIn: null,
+            timeIn: null,
+            personReturning: null,
+            photoUrl: photoUrl,
+            createdAt: new Date().toISOString(),
+          };
+
+          const updatedKeys = [...keys, newKey];
+          await saveKeysToSharePoint(updatedKeys);
+          setShowForm(false);
+          resetForm();
+          alert('✅ Clé enregistrée avec succès !');
+        } catch (error) {
+          console.error('Erreur complète:', error);
+          alert("❌ Erreur lors de l'enregistrement: " + error.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const handleReturn = async (keyId) => {
+        const dateIn = prompt('Date de retour (AAAA-MM-JJ):');
+        if (!dateIn) return;
+        const timeIn = prompt('Heure de retour (HH:MM):');
+        if (!timeIn) return;
+        const personReturning = prompt('Personne qui retourne la clé:');
+        if (!personReturning) return;
+        setLoading(true);
+        try {
+          const updatedKeys = keys.map(k => k.id === keyId ? { ...k, dateIn, timeIn, personReturning, status: 'retournee' } : k);
+          await saveKeysToSharePoint(updatedKeys);
+          alert('✅ Retour enregistré !');
+        } catch (error) {
+          console.error('Erreur:', error);
+          alert('❌ Erreur: ' + error.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const handleDelete = async (keyId) => {
+        if (!window.confirm('Êtes-vous sûr de vouloir supprimer cet enregistrement ?')) return;
+        setLoading(true);
+        try {
+          const updated = keys.filter(k => k.id !== keyId);
+          await saveKeysToSharePoint(updated);
+          alert('✅ Clé supprimée !');
+        } catch (error) {
+          console.error('Erreur:', error);
+          alert('❌ Erreur: ' + error.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      // --- Filtrage + recherche ---
+      const filteredKeys = keys.filter((key) => {
+        if (filter === 'out' && key.dateIn) return false;
+        if (filter === 'in' && !key.dateIn) return false;
+        if (searchQuery) {
+          const q = searchQuery.toLowerCase();
+          const hay = [
+            key.keyNumber, key.owner, key.personBorrowing, key.personGiving, key.reason
+          ].filter(Boolean).map(s => (s + '').toLowerCase());
+          return hay.some(s => s.includes(q));
+        }
+        return true;
+      });
+
+      // --- UI ---
+      if (!account) {
+        return (
+          <div className="min-h-screen flex items-center justify-center p-4">
+            <div className="bg-white rounded-xl shadow-2xl p-12 max-w-md w-full text-center">
+              <div className="mb-8">
+                <div className="text-6xl mb-4">🔑</div>
+                <h1 className="text-3xl font-bold text-gray-800 mb-2">Gestion des Clés</h1>
+                <p className="text-gray-600">Agence Immobilière</p>
+              </div>
+              <p className="text-gray-700 mb-6">Connectez-vous avec votre compte Microsoft 365</p>
+              <button onClick={handleLogin} disabled={loading || !msalInstance}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white px-8 py-4 rounded-lg font-semibold transition-colors shadow-lg disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3">
+                {loading ? '⏳ Connexion…' : 'Se connecter avec Microsoft'}
+              </button>
+              <div className="mt-8 text-sm text-gray-500">
+                <p>🔒 Connexion sécurisée via Microsoft</p>
+                <p>📊 Synchronisation automatique avec SharePoint</p>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="min-h-screen">
+          <div className="container mx-auto px-4 py-8 max-w-6xl">
+            <div className="bg-white rounded-xl shadow-lg p-6 mb-8">
+              <div className="flex justify-between items-start">
+                <div>
+                  <h1 className="text-4xl font-bold text-gray-800 mb-2">🔑 Gestion des Clés</h1>
+                  <p className="text-gray-600">Suivi des mouvements de clés de l'agence</p>
+                </div>
+                <div className="text-right">
+                  <div className="mb-2">
+                    <span className="bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm">✓ Connecté</span>
+                  </div>
+                  <button onClick={handleLogout} className="text-sm text-red-600 hover:text-red-800">Se déconnecter</button>
+                </div>
+              </div>
+            </div>
+
+            {loading && (
+              <div className="bg-blue-100 border border-blue-400 text-blue-800 px-4 py-3 rounded-lg mb-6">⏳ Synchronisation avec SharePoint…</div>
+            )}
+
+            <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
+              <div className="flex flex-wrap gap-4 items-center justify-between mb-4">
+                <div className="flex gap-3">
+                  <button onClick={() => setShowForm(!showForm)} className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors shadow-md">
+                    {showForm ? '✕ Annuler' : '+ Nouvelle sortie de clé'}
+                  </button>
+                  <button onClick={loadKeysFromSharePoint} disabled={loading} className="bg-green-600 hover:bg-green-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors shadow-md disabled:opacity-50">
+                    🔄 Actualiser
+                  </button>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => setFilter('all')} className={`px-4 py-2 rounded-lg font-medium transition-colors ${filter === 'all' ? 'bg-indigo-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>
+                    Tout ({keys.length})
+                  </button>
+                  <button onClick={() => setFilter('out')} className={`px-4 py-2 rounded-lg font-medium transition-colors ${filter === 'out' ? 'bg-orange-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>
+                    En circulation ({keys.filter(k => !k.dateIn).length})
+                  </button>
+                  <button onClick={() => setFilter('in')} className={`px-4 py-2 rounded-lg font-medium transition-colors ${filter === 'in' ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}>
+                    Retournées ({keys.filter(k => k.dateIn).length})
+                  </button>
+                </div>
+              </div>
+              <div className="mt-4">
+                <input type="text" placeholder="🔍 Rechercher une clé…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-lg"/>
+              </div>
+            </div>
+
+            {showForm && (
+              <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
+                <h2 className="text-2xl font-bold text-gray-800 mb-6">Nouvelle sortie de clé</h2>
+                <form onSubmit={handleSubmit} className="space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Numéro de clé *</label>
+                      <input type="text" name="keyNumber" value={formData.keyNumber} onChange={handleInputChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="Ex: A-101"/>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Propriétaire / Bailleur *</label>
+                      <input type="text" name="owner" value={formData.owner} onChange={handleInputChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="Nom du propriétaire"/>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Remise par *</label>
+                      <input type="text" name="personGiving" value={formData.personGiving} onChange={handleInputChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="Nom de l'agent"/>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Empruntée par *</label>
+                      <input type="text" name="personBorrowing" value={formData.personBorrowing} onChange={handleInputChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="Nom de l'emprunteur"/>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Motif *</label>
+                      <select name="reason" value={formData.reason} onChange={handleInputChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500">
+                        <option value="">Sélectionner</option>
+                        <option value="visite">Visite</option>
+                        <option value="travaux">Travaux</option>
+                        <option value="sortie-definitive">Sortie définitive</option>
+                        <option value="etat-des-lieux">État des lieux</option>
+                        <option value="diagnostic">Diagnostic</option>
+                        <option value="expertise">Expertise</option>
+                        <option value="autre">Autre</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Date de sortie *</label>
+                      <input type="date" name="dateOut" value={formData.dateOut} onChange={handleInputChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"/>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Heure de sortie *</label>
+                      <input type="time" name="timeOut" value={formData.timeOut} onChange={handleInputChange} required className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"/>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-gray-700 mb-2">Photo de la clé</label>
+                      <input type="file" accept="image/*" onChange={handlePhotoChange} className="w-full px-4 py-2 border border-gray-300 rounded-lg"/>
+                    </div>
+                  </div>
+
+                  {formData.photoPreview && (
+                    <div className="mt-4">
+                      <p className="text-sm font-semibold text-gray-700 mb-2">Aperçu :</p>
+                      <img src={formData.photoPreview} alt="Aperçu" className="max-w-xs h-48 object-cover rounded-lg shadow-md"/>
+                    </div>
+                  )}
+
+                  <div className="flex gap-3 pt-4">
+                    <button type="submit" disabled={loading} className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg font-semibold transition-colors disabled:opacity-50">
+                      {loading ? 'Enregistrement…' : 'Enregistrer'}
+                    </button>
+                    <button type="button" onClick={() => { setShowForm(false); resetForm(); }} className="bg-gray-300 hover:bg-gray-400 text-gray-800 px-6 py-3 rounded-lg font-semibold transition-colors">
+                      Annuler
+                    </button>
+                  </div>
+                </form>
+              </div>
+            )}
+
+            <div className="space-y-4">
+              {filteredKeys.length === 0 ? (
+                <div className="bg-white rounded-xl shadow-lg p-12 text-center">
+                  <p className="text-gray-500 text-lg">Aucune clé enregistrée</p>
+                </div>
+              ) : (
+                filteredKeys.map((key) => (
+                  <div key={key.id} className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transition-shadow">
+                    <div className="flex flex-col md:flex-row gap-6">
+                      {key.photoUrl && (
+                        <div className="flex-shrink-0">
+                          <a href={key.photoUrl} target="_blank" rel="noopener noreferrer" className="block">
+                            <div className="w-32 h-32 bg-gray-100 rounded-lg shadow-md border-2 border-indigo-200 hover:border-indigo-400 transition-colors flex items-center justify-center">
+                              <span className="text-indigo-600 text-sm font-semibold">📸 Voir photo</span>
+                            </div>
+                          </a>
+                        </div>
+                      )}
+
+                      <div className="flex-grow">
+                        <div className="flex items-start justify-between mb-4">
+                          <div>
+                            <h3 className="text-2xl font-bold text-gray-800">Clé #{key.keyNumber}</h3>
+                            <p className="text-lg text-indigo-600 font-semibold mt-1">{key.owner}</p>
+                            <div className="flex gap-2 mt-2">
+                              <span className={`inline-block px-3 py-1 rounded-full text-sm font-semibold ${key.dateIn ? 'bg-green-100 text-green-800' : 'bg-orange-100 text-orange-800'}`}>
+                                {key.dateIn ? '✓ Retournée' : '→ En circulation'}
+                              </span>
+                              <span className="inline-block px-3 py-1 rounded-full text-sm font-semibold bg-blue-100 text-blue-800">
+                                {key.reason === 'visite' && '👁️ Visite'}
+                                {key.reason === 'travaux' && '🔨 Travaux'}
+                                {key.reason === 'sortie-definitive' && '📦 Sortie définitive'}
+                                {key.reason === 'etat-des-lieux' && '📋 État des lieux'}
+                                {key.reason === 'diagnostic' && '🔍 Diagnostic'}
+                                {key.reason === 'expertise' && '⚖️ Expertise'}
+                                {key.reason === 'autre' && '📌 Autre'}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="flex gap-2">
+                            {!key.dateIn && (
+                              <button onClick={() => handleReturn(key.id)} disabled={loading} className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg font-semibold transition-colors text-sm disabled:opacity-50">
+                                Retournée
+                              </button>
+                            )}
+                            <button onClick={() => handleDelete(key.id)} disabled={loading} className="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-semibold transition-colors text-sm disabled:opacity-50">
+                              Supprimer
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          <div>
+                            <p className="text-sm font-semibold text-gray-600">Remise par :</p>
+                            <p className="text-lg text-gray-800">{key.personGiving}</p>
+                          </div>
+                          <div>
+                            <p className="text-sm font-semibold text-gray-600">Empruntée par :</p>
+                            <p className="text-lg text-gray-800">{key.personBorrowing}</p>
+                          </div>
+                          <div>
+                            <p className="text-sm font-semibold text-gray-600">Sortie :</p>
+                            <p className="text-lg text-gray-800">{key.dateOut} à {key.timeOut}</p>
+                          </div>
+                          {key.dateIn && (
+                            <>
+                              <div>
+                                <p className="text-sm font-semibold text-gray-600">Retour :</p>
+                                <p className="text-lg text-gray-800">{key.dateIn} à {key.timeIn}</p>
+                              </div>
+                              {key.personReturning && (
+                                <div>
+                                  <p className="text-sm font-semibold text-gray-600">Retournée par :</p>
+                                  <p className="text-lg text-gray-800">{key.personReturning}</p>
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
